@@ -64,6 +64,7 @@ def fetch_new_items(seen: set) -> list[dict]:
 
     for source, url in FEEDS.items():
         feed = feedparser.parse(url)
+        print(f"[DEBUG] {source}: 총 {len(feed.entries)}개 항목 수신")  # 추가
         count = 0
 
         for entry in feed.entries:
@@ -75,21 +76,7 @@ def fetch_new_items(seen: set) -> list[dict]:
                 continue
 
             published = parse_published(entry)
-            if published and published < cutoff:
-                continue
-
-            new_items.append({
-                "uid":     uid,
-                "source":  source,
-                "title":   entry.get("title", "(제목 없음)"),
-                "link":    entry.get("link", ""),
-                "summary": entry.get("summary", "")[:800],  # 토큰 절약
-                "published": published.isoformat() if published else "unknown",
-            })
-            seen.add(uid)
-            count += 1
-
-    return new_items
+            print(f"[DEBUG] 항목: {entry.get('title', '')[:50]} | published: {published}")  # 추가
 
 
 # ── Claude 요약·분류 ──────────────────────────────────────────────────────────
