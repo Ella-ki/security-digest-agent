@@ -19,11 +19,11 @@ from pathlib import Path
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 FEEDS = {
-    "Socket.dev Blog": "https://socket.dev/blog/rss.xml",
-    "r/netsec":        "https://www.reddit.com/r/netsec/.rss",
+    "Snyk Blog":   "https://snyk.io/blog/feed/",
+    "r/netsec":    "https://www.reddit.com/r/netsec/.rss",
 }
 
-LOOKBACK_HOURS = 72          # 최근 N시간 이내 항목만 수집
+LOOKBACK_HOURS = 3          # 최근 N시간 이내 항목만 수집
 MAX_ITEMS_PER_FEED = 10     # 피드당 최대 항목 수
 SEEN_FILE = ".seen_items.json"  # 중복 방지용 캐시 (repo에 커밋하거나 Actions cache 활용)
 
@@ -64,7 +64,6 @@ def fetch_new_items(seen: set) -> list[dict]:
 
     for source, url in FEEDS.items():
         feed = feedparser.parse(url)
-        print(f"[DEBUG] {source}: 총 {len(feed.entries)}개 항목 수신")  # 추가
         count = 0
 
         for entry in feed.entries:
@@ -76,7 +75,21 @@ def fetch_new_items(seen: set) -> list[dict]:
                 continue
 
             published = parse_published(entry)
-            print(f"[DEBUG] 항목: {entry.get('title', '')[:50]} | published: {published}")  # 추가
+            if published is not None and published < cutoff:
+                continue
+
+            new_items.append({
+                "uid":     uid,
+                "source":  source,
+                "title":   entry.get("title", "(제목 없음)"),
+                "link":    entry.get("link", ""),
+                "summary": entry.get("summary", "")[:800],  # 토큰 절약
+                "published": published.isoformat() if published else "unknown",
+            })
+            seen.add(uid)
+            count += 1
+
+    return new_items
 
 
 # ── Claude 요약·분류 ──────────────────────────────────────────────────────────
