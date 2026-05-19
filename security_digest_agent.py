@@ -23,7 +23,7 @@ FEEDS = {
     "r/netsec":    "https://www.reddit.com/r/netsec/.rss",
 }
 
-LOOKBACK_HOURS = 3          # 최근 N시간 이내 항목만 수집
+LOOKBACK_HOURS = 72          # 최근 N시간 이내 항목만 수집
 MAX_ITEMS_PER_FEED = 10     # 피드당 최대 항목 수
 SEEN_FILE = ".seen_items.json"  # 중복 방지용 캐시 (repo에 커밋하거나 Actions cache 활용)
 
