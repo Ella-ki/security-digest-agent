@@ -1,39 +1,83 @@
 """
-Security Digest Agent
-- RSS 피드 수집 (Socket.dev blog, r/netsec)
-- Claude API로 요약·심각도 분류
+Security Digest Agent (룰 기반 - API 비용 없음)
+- RSS 피드 수집 (Snyk Blog, r/netsec)
+- 키워드 룰로 심각도 분류 + 태그 자동 추출
 - Slack Webhook으로 배치 전송
 - 3시간마다 GitHub Actions에서 실행
 """
 
 import os
 import json
-import time
 import hashlib
 import feedparser
-import anthropic
 import urllib.request
-import urllib.parse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 FEEDS = {
-    "Snyk Blog":   "https://snyk.io/blog/feed/",
-    "r/netsec":    "https://www.reddit.com/r/netsec/.rss",
+    "Snyk Blog": "https://snyk.io/blog/feed/",
+    "r/netsec":  "https://www.reddit.com/r/netsec/.rss",
 }
 
-LOOKBACK_HOURS = 72          # 최근 N시간 이내 항목만 수집
-MAX_ITEMS_PER_FEED = 10     # 피드당 최대 항목 수
-SEEN_FILE = ".seen_items.json"  # 중복 방지용 캐시 (repo에 커밋하거나 Actions cache 활용)
+LOOKBACK_HOURS = 3
+MAX_ITEMS_PER_FEED = 10
+SEEN_FILE = ".seen_items.json"
 
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+
+# ── 심각도 룰 ─────────────────────────────────────────────────────────────────
+SEVERITY_RULES = [
+    ("CRITICAL", [
+        "remote code execution", "rce", "zero-day", "0-day", "0day",
+        "supply chain attack", "malicious package", "malicious npm",
+        "malicious pypi", "backdoor", "actively exploited",
+        "authentication bypass", "unauthenticated rce",
+    ]),
+    ("HIGH", [
+        "cve-", "data breach", "privilege escalation", "credential theft",
+        "infostealer", "ransomware", "critical vulnerability",
+        "arbitrary code", "sql injection", "xss", "ssrf",
+        "typosquatting", "phishing campaign", "apt ",
+    ]),
+    ("MEDIUM", [
+        "vulnerability", "exploit", "patch", "security advisory",
+        "disclosure", "poc", "proof of concept", "misconfiguration",
+        "exposed", "leaked", "bypass",
+    ]),
+    ("LOW", [
+        "security", "hardening", "best practice", "compliance",
+        "audit", "pentest", "ctf", "bounty",
+    ]),
+]
+
+TAG_RULES = {
+    "npm":           ["npm", "node.js", "nodejs", "package.json"],
+    "pypi":          ["pypi", "pip ", "python package"],
+    "supply-chain":  ["supply chain", "typosquatting", "malicious package", "dependency"],
+    "cve":           ["cve-"],
+    "rce":           ["remote code execution", "rce"],
+    "ransomware":    ["ransomware"],
+    "phishing":      ["phishing"],
+    "apt":           ["apt ", "nation-state", "threat actor"],
+    "browser":       ["chrome", "firefox", "browser extension"],
+    "cloud":         ["aws", "azure", "gcp", "cloud"],
+    "linux":         ["linux", "ubuntu", "debian"],
+    "windows":       ["windows", "microsoft"],
+    "mobile":        ["android", "ios", "mobile"],
+}
+
+SEVERITY_EMOJI = {
+    "CRITICAL": "🔴",
+    "HIGH":     "🟠",
+    "MEDIUM":   "🟡",
+    "LOW":      "🟢",
+    "INFO":     "⚪",
+}
 
 # ── 유틸 ──────────────────────────────────────────────────────────────────────
 
-def item_id(entry: dict) -> str:
-    """항목 고유 ID (URL 기반 해시)"""
+def item_id(entry) -> str:
     key = entry.get("link") or entry.get("id") or entry.get("title", "")
     return hashlib.md5(key.encode()).hexdigest()
 
@@ -49,11 +93,30 @@ def save_seen(seen: set):
 
 
 def parse_published(entry) -> datetime | None:
-    """feedparser published_parsed → datetime(UTC)"""
     t = entry.get("published_parsed") or entry.get("updated_parsed")
     if not t:
         return None
     return datetime(*t[:6], tzinfo=timezone.utc)
+
+
+# ── 심각도·태그 분류 ──────────────────────────────────────────────────────────
+
+def classify(title: str, summary: str) -> tuple[str, list[str]]:
+    text = (title + " " + summary).lower()
+
+    severity = "INFO"
+    for level, keywords in SEVERITY_RULES:
+        if any(kw in text for kw in keywords):
+            severity = level
+            break
+
+    tags = [tag for tag, keywords in TAG_RULES.items() if any(kw in text for kw in keywords)][:3]
+
+    return severity, tags
+
+
+def make_one_line(title: str) -> str:
+    return title if len(title) <= 60 else title[:57] + "..."
 
 
 # ── RSS 수집 ──────────────────────────────────────────────────────────────────
@@ -64,6 +127,7 @@ def fetch_new_items(seen: set) -> list[dict]:
 
     for source, url in FEEDS.items():
         feed = feedparser.parse(url)
+        print(f"[{source}] {len(feed.entries)}개 수신")
         count = 0
 
         for entry in feed.entries:
@@ -78,83 +142,24 @@ def fetch_new_items(seen: set) -> list[dict]:
             if published is not None and published < cutoff:
                 continue
 
+            title   = entry.get("title", "(제목 없음)")
+            summary = entry.get("summary", "")[:500]
+            severity, tags = classify(title, summary)
+
             new_items.append({
-                "uid":     uid,
-                "source":  source,
-                "title":   entry.get("title", "(제목 없음)"),
-                "link":    entry.get("link", ""),
-                "summary": entry.get("summary", "")[:800],  # 토큰 절약
+                "uid":       uid,
+                "source":    source,
+                "title":     title,
+                "link":      entry.get("link", ""),
+                "one_line":  make_one_line(title),
+                "severity":  severity,
+                "tags":      tags,
                 "published": published.isoformat() if published else "unknown",
             })
             seen.add(uid)
             count += 1
 
     return new_items
-
-
-# ── Claude 요약·분류 ──────────────────────────────────────────────────────────
-
-SEVERITY_EMOJI = {
-    "CRITICAL": "🔴",
-    "HIGH":     "🟠",
-    "MEDIUM":   "🟡",
-    "LOW":      "🟢",
-    "INFO":     "⚪",
-}
-
-def analyze_with_claude(items: list[dict]) -> list[dict]:
-    """Claude API로 각 항목 심각도 분류 + 한 줄 요약"""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    items_text = "\n\n".join(
-        f"[{i+1}] SOURCE: {it['source']}\nTITLE: {it['title']}\nSUMMARY: {it['summary']}"
-        for i, it in enumerate(items)
-    )
-
-    prompt = f"""아래는 보안 관련 뉴스/블로그 항목들입니다.
-각 항목에 대해 JSON 배열로만 응답하세요. 다른 텍스트는 절대 포함하지 마세요.
-
-항목:
-{items_text}
-
-응답 형식 (JSON 배열):
-[
-  {{
-    "index": 1,
-    "severity": "CRITICAL|HIGH|MEDIUM|LOW|INFO",
-    "one_line": "한국어로 핵심만 한 문장 요약 (60자 이내)",
-    "tags": ["npm", "supply-chain"] // 관련 태그 1~3개
-  }},
-  ...
-]
-
-심각도 기준:
-- CRITICAL: 즉시 패치 필요한 RCE·인증 우회·악성 패키지 배포
-- HIGH: 데이터 유출 가능·권한 상승·활발히 악용 중
-- MEDIUM: 취약점 공개됐으나 악용 제한적
-- LOW: 보안 권고·모범사례·마이너 버그
-- INFO: 뉴스·트렌드·분석 글"""
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    raw = response.content[0].text.strip()
-    # 혹시 마크다운 펜스 포함 시 제거
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    analyses = json.loads(raw)
-
-    # 원본 items에 분석 결과 병합
-    analysis_map = {a["index"]: a for a in analyses}
-    for i, item in enumerate(items):
-        a = analysis_map.get(i + 1, {})
-        item["severity"] = a.get("severity", "INFO")
-        item["one_line"] = a.get("one_line", item["title"])
-        item["tags"] = a.get("tags", [])
-
-    return items
 
 
 # ── Slack 전송 ────────────────────────────────────────────────────────────────
@@ -170,7 +175,6 @@ def build_slack_blocks(items: list[dict]) -> list[dict]:
         {"type": "divider"}
     ]
 
-    # 심각도 순 정렬
     order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
     items_sorted = sorted(items, key=lambda x: order.index(x.get("severity", "INFO")))
 
@@ -180,7 +184,6 @@ def build_slack_blocks(items: list[dict]) -> list[dict]:
         text  = (
             f"{emoji} *{item['severity']}*  {tags}\n"
             f"*<{item['link']}|{item['title']}>*\n"
-            f"{item['one_line']}\n"
             f"_출처: {item['source']}_"
         )
         blocks.append({
@@ -212,8 +215,7 @@ def send_to_slack(items: list[dict]):
         method="POST"
     )
     with urllib.request.urlopen(req) as resp:
-        status = resp.getcode()
-        print(f"Slack 전송 완료: HTTP {status} | {len(items)}건")
+        print(f"Slack 전송 완료: HTTP {resp.getcode()} | {len(items)}건")
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
@@ -232,10 +234,7 @@ def main():
         save_seen(seen)
         return
 
-    print("Claude API로 분석 중...")
-    analyzed = analyze_with_claude(new_items)
-
-    send_to_slack(analyzed)
+    send_to_slack(new_items)
     save_seen(seen)
     print("완료")
 

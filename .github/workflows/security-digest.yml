@@ -2,9 +2,8 @@ name: Security Digest Agent
 
 on:
   schedule:
-    # 3시간마다 실행 (UTC 기준 0, 3, 6, 9, 12, 15, 18, 21시)
     - cron: "0 0,3,6,9,12,15,18,21 * * *"
-  workflow_dispatch: # 수동 실행도 가능
+  workflow_dispatch:
 
 jobs:
   security-digest:
@@ -14,7 +13,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # seen_items 캐시 복원 (중복 방지)
       - name: Restore seen items cache
         uses: actions/cache@v4
         with:
@@ -29,16 +27,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install feedparser anthropic
+        run: pip install feedparser
 
       - name: Run Security Digest Agent
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python security_digest_agent.py
 
-      # 실행 후 seen_items 캐시 저장
       - name: Save seen items cache
         if: always()
         uses: actions/cache@v4
