@@ -1,7 +1,8 @@
 """
-Security Digest Agent (룰 기반 - API 비용 없음)
+Security Digest Agent (룰 기반 + 한글 번역)
 - RSS 피드 수집 (Snyk Blog, r/netsec)
 - 키워드 룰로 심각도 분류 + 태그 자동 추출
+- 제목 한글 번역 (deep-translator)
 - Slack Webhook으로 배치 전송
 - 3시간마다 GitHub Actions에서 실행
 """
@@ -13,6 +14,7 @@ import feedparser
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from deep_translator import GoogleTranslator
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 FEEDS = {
@@ -20,7 +22,7 @@ FEEDS = {
     "r/netsec":  "https://www.reddit.com/r/netsec/.rss",
 }
 
-LOOKBACK_HOURS = 3
+LOOKBACK_HOURS = 72
 MAX_ITEMS_PER_FEED = 10
 SEEN_FILE = ".seen_items.json"
 
@@ -52,19 +54,19 @@ SEVERITY_RULES = [
 ]
 
 TAG_RULES = {
-    "npm":           ["npm", "node.js", "nodejs", "package.json"],
-    "pypi":          ["pypi", "pip ", "python package"],
-    "supply-chain":  ["supply chain", "typosquatting", "malicious package", "dependency"],
-    "cve":           ["cve-"],
-    "rce":           ["remote code execution", "rce"],
-    "ransomware":    ["ransomware"],
-    "phishing":      ["phishing"],
-    "apt":           ["apt ", "nation-state", "threat actor"],
-    "browser":       ["chrome", "firefox", "browser extension"],
-    "cloud":         ["aws", "azure", "gcp", "cloud"],
-    "linux":         ["linux", "ubuntu", "debian"],
-    "windows":       ["windows", "microsoft"],
-    "mobile":        ["android", "ios", "mobile"],
+    "npm":          ["npm", "node.js", "nodejs", "package.json"],
+    "pypi":         ["pypi", "pip ", "python package"],
+    "supply-chain": ["supply chain", "typosquatting", "malicious package", "dependency"],
+    "cve":          ["cve-"],
+    "rce":          ["remote code execution", "rce"],
+    "ransomware":   ["ransomware"],
+    "phishing":     ["phishing"],
+    "apt":          ["apt ", "nation-state", "threat actor"],
+    "browser":      ["chrome", "firefox", "browser extension"],
+    "cloud":        ["aws", "azure", "gcp", "cloud"],
+    "linux":        ["linux", "ubuntu", "debian"],
+    "windows":      ["windows", "microsoft"],
+    "mobile":       ["android", "ios", "mobile"],
 }
 
 SEVERITY_EMOJI = {
@@ -99,7 +101,7 @@ def parse_published(entry) -> datetime | None:
     return datetime(*t[:6], tzinfo=timezone.utc)
 
 
-# ── 심각도·태그 분류 ──────────────────────────────────────────────────────────
+# ── 분류 ──────────────────────────────────────────────────────────────────────
 
 def classify(title: str, summary: str) -> tuple[str, list[str]]:
     text = (title + " " + summary).lower()
@@ -115,8 +117,18 @@ def classify(title: str, summary: str) -> tuple[str, list[str]]:
     return severity, tags
 
 
-def make_one_line(title: str) -> str:
-    return title if len(title) <= 60 else title[:57] + "..."
+# ── 번역 ──────────────────────────────────────────────────────────────────────
+
+def translate_titles(items: list[dict]) -> list[dict]:
+    """제목 일괄 번역 (실패 시 원문 유지)"""
+    translator = GoogleTranslator(source='en', target='ko')
+    for item in items:
+        try:
+            item["title_ko"] = translator.translate(item["title"])
+        except Exception as e:
+            print(f"[번역 실패] {item['title'][:40]}... → {e}")
+            item["title_ko"] = item["title"]  # 실패 시 원문 유지
+    return items
 
 
 # ── RSS 수집 ──────────────────────────────────────────────────────────────────
@@ -150,8 +162,8 @@ def fetch_new_items(seen: set) -> list[dict]:
                 "uid":       uid,
                 "source":    source,
                 "title":     title,
+                "title_ko":  "",  # 번역 후 채워짐
                 "link":      entry.get("link", ""),
-                "one_line":  make_one_line(title),
                 "severity":  severity,
                 "tags":      tags,
                 "published": published.isoformat() if published else "unknown",
@@ -179,11 +191,13 @@ def build_slack_blocks(items: list[dict]) -> list[dict]:
     items_sorted = sorted(items, key=lambda x: order.index(x.get("severity", "INFO")))
 
     for item in items_sorted:
-        emoji = SEVERITY_EMOJI.get(item["severity"], "⚪")
-        tags  = "  ".join(f"`{t}`" for t in item.get("tags", []))
-        text  = (
+        emoji    = SEVERITY_EMOJI.get(item["severity"], "⚪")
+        tags     = "  ".join(f"`{t}`" for t in item.get("tags", []))
+        title_ko = item.get("title_ko") or item["title"]
+        text = (
             f"{emoji} *{item['severity']}*  {tags}\n"
             f"*<{item['link']}|{item['title']}>*\n"
+            f"{title_ko}\n"
             f"_출처: {item['source']}_"
         )
         blocks.append({
@@ -233,6 +247,9 @@ def main():
         print("새 항목 없음 — 종료")
         save_seen(seen)
         return
+
+    print("번역 중...")
+    new_items = translate_titles(new_items)
 
     send_to_slack(new_items)
     save_seen(seen)

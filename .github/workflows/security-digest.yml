@@ -27,7 +27,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install feedparser
+        run: pip install feedparser deep-translator==1.11.4
 
       - name: Run Security Digest Agent
         env:
