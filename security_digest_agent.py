@@ -22,7 +22,7 @@ FEEDS = {
     "r/netsec":  "https://www.reddit.com/r/netsec/.rss",
 }
 
-LOOKBACK_HOURS = 72
+LOOKBACK_HOURS = 3
 MAX_ITEMS_PER_FEED = 10
 SEEN_FILE = ".seen_items.json"
 
