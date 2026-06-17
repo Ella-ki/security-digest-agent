@@ -32,6 +32,7 @@ jobs:
       - name: Run Security Digest Agent
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python security_digest_agent.py
 
       - name: Save seen items cache

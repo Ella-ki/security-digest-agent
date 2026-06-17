@@ -1,6 +1,7 @@
 """
 Security Digest Agent (룰 기반 + 한글 번역)
-- RSS 피드 수집 (Snyk Blog, r/netsec)
+- RSS 피드 수집 (Snyk Blog, The Hacker News)
+- GitHub Advisory Database 수집 (REST API, 인증 필요)
 - 키워드 룰로 심각도 분류 + 태그 자동 추출
 - 제목 한글 번역 (deep-translator)
 - Slack Webhook으로 배치 전송
@@ -18,13 +19,23 @@ from deep_translator import GoogleTranslator
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 FEEDS = {
-    "Snyk Blog": "https://snyk.io/blog/feed/",
-    "r/netsec":  "https://www.reddit.com/r/netsec/.rss",
+    "Snyk Blog":       "https://snyk.io/blog/feed/",
+    "The Hacker News": "https://feeds.feedburner.com/TheHackersNews",
 }
 
 LOOKBACK_HOURS = 3
 MAX_ITEMS_PER_FEED = 10
 SEEN_FILE = ".seen_items.json"
+
+# GitHub Advisory Database (REST API — RSS/Atom은 deprecated)
+GITHUB_ADVISORIES_URL = "https://api.github.com/advisories?per_page=20&sort=published&direction=desc"
+GITHUB_SEVERITY_MAP = {
+    "critical": "CRITICAL",
+    "high":     "HIGH",
+    "medium":   "MEDIUM",
+    "moderate": "MEDIUM",
+    "low":      "LOW",
+}
 
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
@@ -174,6 +185,92 @@ def fetch_new_items(seen: set) -> list[dict]:
     return new_items
 
 
+# ── GitHub Advisory Database 수집 (REST API) ──────────────────────────────────
+
+def fetch_github_advisories(seen: set, cutoff: datetime) -> list[dict]:
+    """GitHub Advisory Database를 REST API로 수집해 RSS item과 동일한 스키마로 변환.
+
+    인증 필수: 비인증 호출은 rate limit이 매우 낮아 실사용 불가.
+    GITHUB_TOKEN 환경변수가 없으면 건너뛰고 경고만 출력 (스크립트는 죽지 않음).
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("[GitHub Advisory] GITHUB_TOKEN 미설정 — 수집 건너뜀")
+        return []
+
+    req = urllib.request.Request(
+        GITHUB_ADVISORIES_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept":        "application/vnd.github+json",
+            "User-Agent":    "security-digest-agent",
+        },
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            advisories = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[GitHub Advisory] 수집 실패: {e}")
+        return []
+
+    print(f"[GitHub Advisory] {len(advisories)}개 수신")
+    new_items = []
+    count = 0
+
+    for adv in advisories:
+        if count >= MAX_ITEMS_PER_FEED:
+            break
+
+        ghsa_id = adv.get("ghsa_id") or adv.get("html_url", "")
+        if not ghsa_id:
+            continue
+        uid = hashlib.md5(ghsa_id.encode()).hexdigest()
+        if uid in seen:
+            continue
+
+        published = None
+        published_at = adv.get("published_at")
+        if published_at:
+            try:
+                published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+            except ValueError:
+                published = None
+        if published is not None and published < cutoff:
+            continue
+
+        title = adv.get("summary") or adv.get("cve_id") or ghsa_id
+
+        severity = GITHUB_SEVERITY_MAP.get((adv.get("severity") or "").lower(), "INFO")
+
+        # 태그: 영향받는 패키지의 ecosystem들 + cve_id 여부
+        tags = []
+        for vuln in adv.get("vulnerabilities") or []:
+            pkg = (vuln.get("package") or {})
+            eco = pkg.get("ecosystem")
+            if eco and eco.lower() not in tags:
+                tags.append(eco.lower())
+        if adv.get("cve_id") and "cve" not in tags:
+            tags.append("cve")
+        tags = tags[:3]
+
+        new_items.append({
+            "uid":       uid,
+            "source":    "GitHub Advisory",
+            "title":     title,
+            "title_ko":  "",  # 번역 후 채워짐
+            "link":      adv.get("html_url", ""),
+            "severity":  severity,
+            "tags":      tags,
+            "published": published.isoformat() if published else "unknown",
+        })
+        seen.add(uid)
+        count += 1
+
+    return new_items
+
+
 # ── Slack 전송 ────────────────────────────────────────────────────────────────
 
 def build_slack_blocks(items: list[dict]) -> list[dict]:
@@ -240,7 +337,10 @@ def main():
     seen = load_seen()
     print(f"기존 캐시: {len(seen)}개 항목")
 
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+
     new_items = fetch_new_items(seen)
+    new_items += fetch_github_advisories(seen, cutoff)
     print(f"새 항목 수집: {len(new_items)}건")
 
     if not new_items:
