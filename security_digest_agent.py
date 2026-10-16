@@ -23,7 +23,7 @@ FEEDS = {
     "The Hacker News": "https://feeds.feedburner.com/TheHackersNews",
 }
 
-LOOKBACK_HOURS = 3
+LOOKBACK_HOURS = 6
 MAX_ITEMS_PER_FEED = 10
 SEEN_FILE = ".seen_items.json"
 
