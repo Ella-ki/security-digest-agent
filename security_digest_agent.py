@@ -16,6 +16,7 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from deep_translator import GoogleTranslator
+from deep_translator.exceptions import TooManyRequests
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
 FEEDS = {
@@ -38,6 +39,9 @@ GITHUB_SEVERITY_MAP = {
 }
 
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+
+# Slack 메시지당 블록 최대 50개 제한 — 항목당 2블록 + 헤더/구분선/푸터 3블록
+MAX_ITEMS_PER_MESSAGE = 20
 
 # ── 심각도 룰 ─────────────────────────────────────────────────────────────────
 SEVERITY_RULES = [
@@ -105,6 +109,13 @@ def save_seen(seen: set):
     Path(SEEN_FILE).write_text(json.dumps(list(seen)))
 
 
+def chunked(items: list, size: int) -> list[list]:
+    """items를 size개씩 나눈 리스트 반환"""
+    if size <= 0:
+        raise ValueError("size는 1 이상이어야 합니다")
+    return [items[start:start + size] for start in range(0, len(items), size)]
+
+
 def parse_published(entry) -> datetime | None:
     t = entry.get("published_parsed") or entry.get("updated_parsed")
     if not t:
@@ -130,15 +141,29 @@ def classify(title: str, summary: str) -> tuple[str, list[str]]:
 
 # ── 번역 ──────────────────────────────────────────────────────────────────────
 
+def translate_with_google(titles: list[str]) -> list[str]:
+    """deep-translator의 Google 번역 (비공식 웹 엔드포인트 — 429 차단이 잦음).
+    429를 받으면 나머지는 더 요청하지 않고 원문으로 둔다."""
+    translator = GoogleTranslator(source="en", target="ko")
+    translated = []
+    for index, title in enumerate(titles):
+        try:
+            translated.append(translator.translate(title) or title)
+        except TooManyRequests:
+            print(f"[번역 실패] Google 429 차단 — 나머지 {len(titles) - index}건 원문 유지")
+            translated.extend(titles[index:])
+            break
+        except Exception as e:
+            print(f"[번역 실패] {title[:40]}... → {e}")
+            translated.append(title)
+    return translated
+
+
 def translate_titles(items: list[dict]) -> list[dict]:
     """제목 일괄 번역 (실패 시 원문 유지)"""
-    translator = GoogleTranslator(source='en', target='ko')
-    for item in items:
-        try:
-            item["title_ko"] = translator.translate(item["title"])
-        except Exception as e:
-            print(f"[번역 실패] {item['title'][:40]}... → {e}")
-            item["title_ko"] = item["title"]  # 실패 시 원문 유지
+    translated = translate_with_google([item["title"] for item in items])
+    for item, title_ko in zip(items, translated):
+        item["title_ko"] = title_ko
     return items
 
 
@@ -179,7 +204,6 @@ def fetch_new_items(seen: set) -> list[dict]:
                 "tags":      tags,
                 "published": published.isoformat() if published else "unknown",
             })
-            seen.add(uid)
             count += 1
 
     return new_items
@@ -265,7 +289,6 @@ def fetch_github_advisories(seen: set, cutoff: datetime) -> list[dict]:
             "tags":      tags,
             "published": published.isoformat() if published else "unknown",
         })
-        seen.add(uid)
         count += 1
 
     return new_items
@@ -273,7 +296,7 @@ def fetch_github_advisories(seen: set, cutoff: datetime) -> list[dict]:
 
 # ── Slack 전송 ────────────────────────────────────────────────────────────────
 
-def build_slack_blocks(items: list[dict]) -> list[dict]:
+def build_slack_blocks(items: list[dict], page: int = 1, total_pages: int = 1) -> list[dict]:
     now_kst = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
 
     blocks = [
@@ -290,13 +313,11 @@ def build_slack_blocks(items: list[dict]) -> list[dict]:
     for item in items_sorted:
         emoji    = SEVERITY_EMOJI.get(item["severity"], "⚪")
         tags     = "  ".join(f"`{t}`" for t in item.get("tags", []))
-        title_ko = item.get("title_ko") or item["title"]
-        text = (
-            f"{emoji} *{item['severity']}*  {tags}\n"
-            f"*<{item['link']}|{item['title']}>*\n"
-            f"{title_ko}\n"
-            f"_출처: {item['source']}_"
-        )
+        title_ko = item.get("title_ko") or ""
+        text = f"{emoji} *{item['severity']}*  {tags}\n*<{item['link']}|{item['title']}>*\n"
+        if title_ko and title_ko != item["title"]:  # 번역 실패 시 같은 제목 두 번 출력 방지
+            text += f"{title_ko}\n"
+        text += f"_출처: {item['source']}_"
         blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn", "text": text}
@@ -305,28 +326,39 @@ def build_slack_blocks(items: list[dict]) -> list[dict]:
 
     blocks.append({
         "type": "context",
-        "elements": [{"type": "mrkdwn", "text": f"총 {len(items)}건 | 최근 {LOOKBACK_HOURS}시간 이내 항목"}]
+        "elements": [{"type": "mrkdwn", "text": f"{page}/{total_pages} | {len(items)}건 | 최근 {LOOKBACK_HOURS}시간 이내 항목"}]
     })
 
     return blocks
 
 
-def send_to_slack(items: list[dict]):
-    if not items:
-        print("새 항목 없음 — Slack 전송 스킵")
-        return
-
-    blocks = build_slack_blocks(items)
+def post_to_slack(blocks: list[dict]) -> int:
     payload = json.dumps({"blocks": blocks}).encode("utf-8")
-
     req = urllib.request.Request(
         SLACK_WEBHOOK_URL,
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST"
     )
-    with urllib.request.urlopen(req) as resp:
-        print(f"Slack 전송 완료: HTTP {resp.getcode()} | {len(items)}건")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.getcode()
+
+
+def send_to_slack(items: list[dict], seen: set):
+    """메시지 단위로 전송하고, 전송에 성공한 항목만 seen에 기록한다.
+    실패 시 예외를 그대로 올려 워크플로가 실패로 표시되며, 미전송 항목은 다음 실행에서 재시도된다."""
+    if not items:
+        print("새 항목 없음 — Slack 전송 스킵")
+        return
+
+    order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    items_sorted = sorted(items, key=lambda x: order.index(x.get("severity", "INFO")))
+    chunks = chunked(items_sorted, MAX_ITEMS_PER_MESSAGE)
+
+    for page, chunk in enumerate(chunks, start=1):
+        status = post_to_slack(build_slack_blocks(chunk, page, len(chunks)))
+        seen.update(item["uid"] for item in chunk)
+        print(f"Slack 전송 완료: HTTP {status} | {page}/{len(chunks)} | {len(chunk)}건")
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
@@ -345,14 +377,16 @@ def main():
 
     if not new_items:
         print("새 항목 없음 — 종료")
-        save_seen(seen)
         return
 
     print("번역 중...")
     new_items = translate_titles(new_items)
 
-    send_to_slack(new_items)
-    save_seen(seen)
+    try:
+        send_to_slack(new_items, seen)
+    finally:
+        # seen에는 전송 성공분만 들어있으므로 실패해도 저장 — 실패분은 다음 실행에서 재시도
+        save_seen(seen)
     print("완료")
 
 
